@@ -60,15 +60,6 @@ class WebSocketClientTransport:
             # Check for timeout
             if time.time() - start_time > timeout:
                 self.close()
-                # This forces the background thread to stop the OS connect attempt
-                if self.ws:
-                    self.ws.keep_running = False # Tell the loop to stop
-                    self.ws.close()             # Close the socket
-
-                # Don't leave the thread hanging
-                if self._thread and self._thread.is_alive():
-                    self._thread.join(timeout=1.0)
-
                 return f"Failed to connect to {self.url} within {timeout}s"
 
             # This small sleep allows the OS and other threads to breathe
@@ -79,16 +70,29 @@ class WebSocketClientTransport:
         return ""
 
     def close(self):
-        if self.ws:
-            # This triggers the websocket loop to stop
-            self.ws.close()
-
-        if self._thread and self._thread.is_alive():
-            # Wait for the thread to actually finish
-            self._thread.join(timeout=2.0)
-
+        ws = self.ws
+        worker = self._thread
         self._open = False
-        self.ws = None
+        try:
+            if ws is not None:
+                ws.keep_running = False
+                # WebSocketApp.close() can dereference ws.sock after the worker
+                # has cleared it. Keep a stable reference while closing instead.
+                sock = ws.sock
+                if sock is not None:
+                    sock.close()
+                    close_frame = getattr(sock, "close_frame", None)
+                    if close_frame is not None:
+                        ws.last_close_frame = close_frame
+        finally:
+            try:
+                if worker and worker is not threading.current_thread() and worker.is_alive():
+                    worker.join(timeout=2.0)
+            finally:
+                self._open = False
+                self.ws = None
+                if worker is None or not worker.is_alive():
+                    self._thread = None
 
     def configure(self, tx_id, rx_id, protocol="uds", bus="DIAG", target=None, dialog_type="0"):
         return True
@@ -138,5 +142,9 @@ class WebSocketClientTransport:
             except queue.Empty:
                 break
 
-        self.write(data)
-        return self.readData(timeout)
+        try:
+            self.write(data)
+            return self.readData(timeout)
+        except RuntimeError as e:
+            print(f"Error during send/receive: {e}")
+            return "Error"
